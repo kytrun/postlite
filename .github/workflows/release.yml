@@ -1,0 +1,200 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-linux:
+    name: Build Linux ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            platform: x86_64
+            image: messense/rust-musl-cross:x86_64-musl
+            cc: x86_64-linux-musl-gcc
+
+          - arch: arm64
+            platform: aarch64
+            image: messense/rust-musl-cross:aarch64-musl
+            cc: aarch64-linux-musl-gcc
+
+    container:
+      image: ${{ matrix.image }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Download dependencies
+        run: |
+          go mod download
+
+      - name: Build
+        env:
+          CGO_ENABLED: "1"
+          GOOS: linux
+          GOARCH: ${{ matrix.arch }}
+          CC: ${{ matrix.cc }}
+        run: |
+          set -eux
+
+          mkdir -p dist
+
+          go build \
+            -tags vtable \
+            -trimpath \
+            -ldflags="-s -w -linkmode external -extldflags '-static'" \
+            -o "dist/postlite-linux-${GOARCH}" \
+            ./cmd/postlite
+
+      - name: Verify binary
+        run: |
+          set -eux
+
+          BINARY="dist/postlite-linux-${{ matrix.arch }}"
+
+          file "$BINARY"
+
+          echo "Checking dynamic dependencies..."
+
+          if ldd "$BINARY" 2>&1 | grep -q "not a dynamic executable"; then
+            echo "Static binary: OK"
+          else
+            echo "ERROR: binary is dynamically linked"
+            ldd "$BINARY" || true
+            exit 1
+          fi
+
+      - name: Package
+        run: |
+          set -eux
+
+          cd dist
+
+          tar -czf \
+            "postlite-linux-${{ matrix.arch }}.tar.gz" \
+            "postlite-linux-${{ matrix.arch }}"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: postlite-linux-${{ matrix.arch }}
+          path: dist/postlite-linux-${{ matrix.arch }}.tar.gz
+
+
+  build-windows:
+    name: Build Windows amd64
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: "1.22"
+
+      - name: Install MinGW
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-mingw-w64-x86-64
+
+      - name: Download dependencies
+        run: |
+          go mod download
+
+      - name: Build
+        env:
+          CGO_ENABLED: "1"
+          GOOS: windows
+          GOARCH: amd64
+          CC: x86_64-w64-mingw32-gcc
+        run: |
+          set -eux
+
+          mkdir -p dist
+
+          go build \
+            -tags vtable \
+            -trimpath \
+            -ldflags="-s -w" \
+            -o dist/postlite-windows-amd64.exe \
+            ./cmd/postlite
+
+      - name: Verify binary
+        run: |
+          file dist/postlite-windows-amd64.exe
+
+      - name: Package
+        run: |
+          cd dist
+
+          zip \
+            postlite-windows-amd64.zip \
+            postlite-windows-amd64.exe
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: postlite-windows-amd64
+          path: dist/postlite-windows-amd64.zip
+
+
+  release:
+    name: Create GitHub Release
+    needs:
+      - build-linux
+      - build-windows
+
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+
+      - name: Prepare release files
+        run: |
+          set -eux
+
+          mkdir -p release
+
+          find dist -type f -name "*.tar.gz" -exec cp {} release/ \;
+          find dist -type f -name "*.zip" -exec cp {} release/ \;
+
+          cd release
+
+          sha256sum * > SHA256SUMS
+
+          echo "Release files:"
+          ls -lh
+
+          echo
+          echo "SHA256:"
+          cat SHA256SUMS
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          generate_release_notes: true
+          files: |
+            release/*.tar.gz
+            release/*.zip
+            release/SHA256SUMS
